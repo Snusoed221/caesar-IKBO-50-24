@@ -1,0 +1,16 @@
+# Compiled files
+*.o
+*.so
+
+# Output files
+output.txt
+output2.txt
+
+# Temporary files
+*~
+*.swp
+*.swo
+
+# Python cache
+__pycache__/
+*.pyc
