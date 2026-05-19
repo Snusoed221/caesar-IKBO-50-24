@@ -3,14 +3,14 @@ CXXFLAGS = -Wall -Wextra -pedantic -fPIC -O2 -pthread
 
 all: libcaesar.so secure_copy
 
-# Библиотека из Задания 1
+# Задание 1
 libcaesar.so: caesar.o
 	$(CXX) -shared -o $@ $^
 
 caesar.o: caesar.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-# Новая программа Задания 2
+# Задание 2
 secure_copy: secure_copy.o
 	$(CXX) -o $@ $< -L. -lcaesar -Wl,-rpath=. -pthread
 
@@ -31,3 +31,26 @@ clean:
 	rm -f *.o *.so secure_copy output*.txt big.bin
 
 .PHONY: all install test clean
+
+# Задание 3
+CXX = g++
+CXXFLAGS = -Wall -Wextra -pedantic -fPIC -O2 -pthread -std=c++11
+
+all: libcaesar.so secure_copy
+
+libcaesar.so: caesar.o
+	$(CXX) -shared -o $@ $^
+
+caesar.o: caesar.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+secure_copy: secure_copy.o
+	$(CXX) -o $@ $< -L. -lcaesar -Wl,-rpath=. -pthread
+
+secure_copy.o: secure_copy.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+clean:
+	rm -f *.o *.so secure_copy log.txt output* *.bin
+
+.PHONY: all clean

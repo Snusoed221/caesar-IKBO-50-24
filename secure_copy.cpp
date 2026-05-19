@@ -6,6 +6,10 @@
 #include <pthread.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <ctime>
+#include <vector>
+#include <string>
 
 extern "C" {
     void set_key(char key);
@@ -21,33 +25,170 @@ void sigint_handler(int) {
 
 const int BUFFER_SIZE = 8192;
 
-struct SharedData {
-    FILE* in;
-    FILE* out;
-    char buffer[BUFFER_SIZE];
-    int buf_len;
-    bool eof;
-    pthread_mutex_t mutex;
-    pthread_cond_t not_empty;
-    pthread_cond_t not_full;
-};
+pthread_mutex_t counter_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-void* producer(void* arg) {
-    auto* sh = static_cast<SharedData*>(arg);
-    char temp[BUFFER_SIZE];
+int copied_count = 0;
+std::vector<std::string> files_to_copy;
+std::string output_dir;
+int next_file_index = 0;
+
+void log_operation(const std::string& thread_id, const std::string& filename,
+                   const std::string& status, double duration_sec) {
+    pthread_mutex_lock(&log_mutex);
+    FILE* log = fopen("log.txt", "a");
+    if (log) {
+        time_t now = time(nullptr);
+        char time_buf[80];
+        strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", localtime(&now));
+
+        fprintf(log, "[%s] Поток %s | Файл: %s | Результат: %s | Время: %.3f сек\n",
+                time_buf, thread_id.c_str(), filename.c_str(), status.c_str(), duration_sec);
+        fclose(log);
+    }
+    pthread_mutex_unlock(&log_mutex);
+}
+
+bool process_file(const std::string& input_path, const std::string& out_dir) {
+    std::string filename = input_path.substr(input_path.find_last_of('/') + 1);
+    if (filename.empty()) filename = input_path;
+
+    std::string output_path = out_dir + "/" + filename;
+
+    clock_t start = clock();
+
+    FILE* fin = fopen(input_path.c_str(), "rb");
+    if (!fin) {
+        log_operation(std::to_string(pthread_self()), filename,
+                     "ОШИБКА: входной файл не найден", 0.0);
+        return false;
+    }
+
+    FILE* fout = fopen(output_path.c_str(), "wb");
+    if (!fout) {
+        fclose(fin);
+        log_operation(std::to_string(pthread_self()), filename 
+                     "ОШИБКА: не могу создать выходной файл", 0.0);
+        return false;
+    }
+
+    char buffer[BUFFER_SIZE];
+    size_t bytes_read;
+    bool success = true;
+
+    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, fin)) > 0) {
+        if (!keep_running) {
+            success = false;
+            break;
+        }
+        caesar(buffer, buffer, static_cast<int>(bytes_read));
+        if (fwrite(buffer, 1, bytes_read, fout) != bytes_read) {
+            success = false;
+            break;
+        }
+    }
+
+    if (ferror(fin)) {
+        success = false;
+    }
+
+    fclose(fin);
+    fclose(fout);
+
+    double duration = static_cast<double>(clock() - start) / CLOCKS_PER_SEC;
+
+    if (success) {
+        log_operation(std::to_string(pthread_self()), filename, "УСПЕХ", duration);
+        return true;
+    } else {
+        log_operation(std::to_string(pthread_self()), filename, "ОШИБКА чтения/записи", duration);
+        return false;
+    }
+}
+
+void* worker_thread(void* arg) {
+    int thread_id = *(int*)arg;
+    delete (int*)arg;
 
     while (keep_running) {
-        pthread_mutex_lock(&sh->mutex);
-        while (sh->buf_len > 0 && keep_running) {
-            pthread_cond_wait(&sh->not_full, &sh->mutex);
-        }
-        if (!keep_running) {
-            pthread_mutex_unlock(&sh->mutex);
-            return nullptr;
-        }
-        pthread_mutex_unlock(&sh->mutex);
+        int file_idx = -1;
 
-        size_t bytes = fread(temp, 1, BUFFER_SIZE, sh->in);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 5;
+
+        if (pthread_mutex_timedlock(&counter_mutex, &ts) != 0) {
+            std::cerr << "Возможная взаимоблокировка: поток " << thread_id
+                      << " ожидает мьютекс более 5 секунд" << std::endl;
+            continue;
+        }
+
+        if (next_file_index < (int)files_to_copy.size()) {
+            file_idx = next_file_index++;
+        }
+
+        pthread_mutex_unlock(&counter_mutex);
+
+        if (file_idx == -1) break;
+
+        const std::string& input_file = files_to_copy[file_idx];
+
+        if (process_file(input_file, output_dir)) {
+            pthread_mutex_lock(&counter_mutex);
+            copied_count++;
+            pthread_mutex_unlock(&counter_mutex);
+        }
+    }
+    return nullptr;
+}
+
+int main(int argc, char* argv[]) {
+    if (argc < 4) {
+        std::cerr << "Использование: ./secure_copy file1 [file2 ...] output_dir/ key\n";
+        return 1;
+    }
+
+    int key = atoi(argv[argc-1]) & 0xFF;
+    set_key(static_cast<char>(key));
+
+    output_dir = argv[argc-2];
+
+    mkdir(output_dir.c_str(), 0755);
+
+    for (int i = 1; i < argc - 2; ++i) {
+        files_to_copy.push_back(argv[i]);
+    }
+
+    if (files_to_copy.empty()) {
+        std::cerr << "Нет входных файлов!\n";
+        return 1;
+    }
+
+    std::cout << "Запуск: " << files_to_copy.size() << " файлов → " << output_dir 
+              << " (ключ=" << key << ")" << std::endl;
+
+    signal(SIGINT, sigint_handler);
+
+    const int NUM_THREADS = 3;
+    pthread_t threads[NUM_THREADS];
+
+    for (int i = 0; i < NUM_THREADS; ++i) {
+        int* tid = new int(i + 1);
+        pthread_create(&threads[i], nullptr, worker_thread, tid);
+    }
+
+    for (int i = 0; i < NUM_THREADS; ++i) {
+        pthread_join(threads[i], nullptr);
+    }
+
+    std::cout << "\nГотово! Успешно обработано: " << copied_count 
+              << " из " << files_to_copy.size() << " файлов." << std::endl;
+
+    pthread_mutex_destroy(&counter_mutex);
+    pthread_mutex_destroy(&log_mutex);
+
+    return 0;
+}        size_t bytes = fread(temp, 1, BUFFER_SIZE, sh->in);
         if (bytes == 0) {
             pthread_mutex_lock(&sh->mutex);
             sh->eof = true;
