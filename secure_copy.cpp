@@ -10,6 +10,7 @@
 #include <ctime>
 #include <vector>
 #include <string>
+#include <iomanip>
 
 extern "C" {
     void set_key(char key);
@@ -24,16 +25,27 @@ void sigint_handler(int) {
 }
 
 const int BUFFER_SIZE = 8192;
+const int MAX_WORKERS = 4;
 
-pthread_mutex_t counter_mutex = PTHREAD_MUTEX_INITIALIZER;
+// ====================== Статистика ======================
+struct Stats {
+    double total_time = 0.0;
+    double avg_time_per_file = 0.0;
+    int files_processed = 0;
+    std::string mode;
+};
+
+// ====================== Глобальные ресурсы ======================
+pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-int copied_count = 0;
 std::vector<std::string> files_to_copy;
 std::string output_dir;
 int next_file_index = 0;
+int copied_count = 0;
 
-void log_operation(const std::string& thread_id, const std::string& filename,
+// ====================== Логирование ======================
+void log_operation(const std::string& thread_id, const std::string& filename, 
                    const std::string& status, double duration_sec) {
     pthread_mutex_lock(&log_mutex);
     FILE* log = fopen("log.txt", "a");
@@ -41,7 +53,7 @@ void log_operation(const std::string& thread_id, const std::string& filename,
         time_t now = time(nullptr);
         char time_buf[80];
         strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", localtime(&now));
-
+        
         fprintf(log, "[%s] Поток %s | Файл: %s | Результат: %s | Время: %.3f сек\n",
                 time_buf, thread_id.c_str(), filename.c_str(), status.c_str(), duration_sec);
         fclose(log);
@@ -49,114 +61,163 @@ void log_operation(const std::string& thread_id, const std::string& filename,
     pthread_mutex_unlock(&log_mutex);
 }
 
+// ====================== Обработка одного файла ======================
 bool process_file(const std::string& input_path, const std::string& out_dir) {
     std::string filename = input_path.substr(input_path.find_last_of('/') + 1);
     if (filename.empty()) filename = input_path;
 
     std::string output_path = out_dir + "/" + filename;
 
-    clock_t start = clock();
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
 
     FILE* fin = fopen(input_path.c_str(), "rb");
     if (!fin) {
-        log_operation(std::to_string(pthread_self()), filename,
-                     "ОШИБКА: входной файл не найден", 0.0);
+        log_operation(std::to_string(pthread_self()), filename, "ОШИБКА открытия входного", 0.0);
         return false;
     }
 
     FILE* fout = fopen(output_path.c_str(), "wb");
     if (!fout) {
         fclose(fin);
-        log_operation(std::to_string(pthread_self()), filename 
-                     "ОШИБКА: не могу создать выходной файл", 0.0);
+        log_operation(std::to_string(pthread_self()), filename, "ОШИБКА создания выходного", 0.0);
         return false;
     }
 
     char buffer[BUFFER_SIZE];
-    size_t bytes_read;
+    size_t bytes;
     bool success = true;
 
-    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, fin)) > 0) {
-        if (!keep_running) {
+    while ((bytes = fread(buffer, 1, BUFFER_SIZE, fin)) > 0) {
+        if (!keep_running) { 
+            success = false; 
+            break; 
+        }
+        caesar(buffer, buffer, static_cast<int>(bytes));
+        if (fwrite(buffer, 1, bytes, fout) != bytes) {
             success = false;
             break;
         }
-        caesar(buffer, buffer, static_cast<int>(bytes_read));
-        if (fwrite(buffer, 1, bytes_read, fout) != bytes_read) {
-            success = false;
-            break;
-        }
-    }
-
-    if (ferror(fin)) {
-        success = false;
     }
 
     fclose(fin);
     fclose(fout);
 
-    double duration = static_cast<double>(clock() - start) / CLOCKS_PER_SEC;
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double duration = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) * 1e-9;
 
     if (success) {
         log_operation(std::to_string(pthread_self()), filename, "УСПЕХ", duration);
         return true;
     } else {
-        log_operation(std::to_string(pthread_self()), filename, "ОШИБКА чтения/записи", duration);
+        log_operation(std::to_string(pthread_self()), filename, "ОШИБКА", duration);
         return false;
     }
 }
 
+// ====================== Рабочий поток ======================
 void* worker_thread(void* arg) {
-    int thread_id = *(int*)arg;
-    delete (int*)arg;
+    (void)arg; // убираем предупреждение
 
     while (keep_running) {
         int file_idx = -1;
 
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += 5;
-
-        if (pthread_mutex_timedlock(&counter_mutex, &ts) != 0) {
-            std::cerr << "Возможная взаимоблокировка: поток " << thread_id
-                      << " ожидает мьютекс более 5 секунд" << std::endl;
-            continue;
-        }
-
+        pthread_mutex_lock(&queue_mutex);
         if (next_file_index < (int)files_to_copy.size()) {
             file_idx = next_file_index++;
         }
-
-        pthread_mutex_unlock(&counter_mutex);
+        pthread_mutex_unlock(&queue_mutex);
 
         if (file_idx == -1) break;
 
         const std::string& input_file = files_to_copy[file_idx];
 
         if (process_file(input_file, output_dir)) {
-            pthread_mutex_lock(&counter_mutex);
+            pthread_mutex_lock(&queue_mutex);
             copied_count++;
-            pthread_mutex_unlock(&counter_mutex);
+            pthread_mutex_unlock(&queue_mutex);
         }
     }
     return nullptr;
 }
 
+// ====================== Последовательный режим ======================
+Stats run_sequential() {
+    Stats stats;
+    stats.mode = "SEQUENTIAL";
+    struct timespec start_total, end_total;
+    clock_gettime(CLOCK_MONOTONIC, &start_total);
+
+    copied_count = 0;
+    for (const auto& file : files_to_copy) {
+        if (process_file(file, output_dir)) {
+            copied_count++;
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end_total);
+    stats.total_time = (end_total.tv_sec - start_total.tv_sec) + 
+                       (end_total.tv_nsec - start_total.tv_nsec) * 1e-9;
+    stats.files_processed = copied_count;
+    if (stats.files_processed > 0)
+        stats.avg_time_per_file = stats.total_time / stats.files_processed;
+
+    return stats;
+}
+
+// ====================== Параллельный режим ======================
+Stats run_parallel() {
+    Stats stats;
+    stats.mode = "PARALLEL";
+    struct timespec start_total, end_total;
+    clock_gettime(CLOCK_MONOTONIC, &start_total);
+
+    copied_count = 0;
+    next_file_index = 0;
+
+    pthread_t workers[MAX_WORKERS];
+    for (int i = 0; i < MAX_WORKERS; ++i) {
+        pthread_create(&workers[i], nullptr, worker_thread, nullptr);
+    }
+
+    for (int i = 0; i < MAX_WORKERS; ++i) {
+        pthread_join(workers[i], nullptr);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end_total);
+    stats.total_time = (end_total.tv_sec - start_total.tv_sec) + 
+                       (end_total.tv_nsec - start_total.tv_nsec) * 1e-9;
+    stats.files_processed = copied_count;
+    if (stats.files_processed > 0)
+        stats.avg_time_per_file = stats.total_time / stats.files_processed;
+
+    return stats;
+}
+
+// ====================== main ======================
 int main(int argc, char* argv[]) {
     if (argc < 4) {
-        std::cerr << "Использование: ./secure_copy file1 [file2 ...] output_dir/ key\n";
+        std::cerr << "Использование: ./secure_copy file1 [file2 ...] output_dir/ key [--mode=sequential|parallel]\n";
         return 1;
     }
 
-    int key = atoi(argv[argc-1]) & 0xFF;
+    std::string mode_arg = "auto";
+    int key_pos = argc - 1;
+
+    if (argc > 1 && std::string(argv[argc-1]).rfind("--mode=", 0) == 0) {
+        mode_arg = argv[argc-1];
+        key_pos = argc - 2;
+    }
+
+    int key = atoi(argv[key_pos]) & 0xFF;
     set_key(static_cast<char>(key));
 
-    output_dir = argv[argc-2];
-
+    output_dir = argv[key_pos - 1];
     mkdir(output_dir.c_str(), 0755);
 
-    for (int i = 1; i < argc - 2; ++i) {
-        files_to_copy.push_back(argv[i]);
+    files_to_copy.clear();
+    for (int i = 1; i < key_pos - 1; ++i) {
+        files_to_copy.emplace_back(argv[i]);
     }
 
     if (files_to_copy.empty()) {
@@ -169,126 +230,32 @@ int main(int argc, char* argv[]) {
 
     signal(SIGINT, sigint_handler);
 
-    const int NUM_THREADS = 3;
-    pthread_t threads[NUM_THREADS];
+    Stats stats;
 
-    for (int i = 0; i < NUM_THREADS; ++i) {
-        int* tid = new int(i + 1);
-        pthread_create(&threads[i], nullptr, worker_thread, tid);
-    }
-
-    for (int i = 0; i < NUM_THREADS; ++i) {
-        pthread_join(threads[i], nullptr);
-    }
-
-    std::cout << "\nГотово! Успешно обработано: " << copied_count 
-              << " из " << files_to_copy.size() << " файлов." << std::endl;
-
-    pthread_mutex_destroy(&counter_mutex);
-    pthread_mutex_destroy(&log_mutex);
-
-    return 0;
-}        size_t bytes = fread(temp, 1, BUFFER_SIZE, sh->in);
-        if (bytes == 0) {
-            pthread_mutex_lock(&sh->mutex);
-            sh->eof = true;
-            pthread_cond_signal(&sh->not_empty);
-            pthread_mutex_unlock(&sh->mutex);
-            return nullptr;
+    if (mode_arg == "auto") {
+        if (files_to_copy.size() < 5) {
+            mode_arg = "--mode=sequential";
+            stats = run_sequential();
+        } else {
+            mode_arg = "--mode=parallel";
+            stats = run_parallel();
         }
-
-        caesar(temp, temp, static_cast<int>(bytes));  // шифруем
-
-        pthread_mutex_lock(&sh->mutex);
-        memcpy(sh->buffer, temp, bytes);
-        sh->buf_len = static_cast<int>(bytes);
-        pthread_cond_signal(&sh->not_empty);
-        pthread_mutex_unlock(&sh->mutex);
-    }
-    return nullptr;
-}
-
-void* consumer(void* arg) {
-    auto* sh = static_cast<SharedData*>(arg);
-    char temp[BUFFER_SIZE];
-
-    while (keep_running) {
-        pthread_mutex_lock(&sh->mutex);
-        while (sh->buf_len == 0 && !sh->eof && keep_running) {
-            pthread_cond_wait(&sh->not_empty, &sh->mutex);
-        }
-        if (sh->buf_len == 0 && sh->eof) {
-            pthread_mutex_unlock(&sh->mutex);
-            return nullptr;
-        }
-        if (!keep_running) {
-            pthread_mutex_unlock(&sh->mutex);
-            return nullptr;
-        }
-
-        int len = sh->buf_len;
-        memcpy(temp, sh->buffer, len);
-        sh->buf_len = 0;
-        pthread_cond_signal(&sh->not_full);
-        pthread_mutex_unlock(&sh->mutex);
-
-        fwrite(temp, 1, len, sh->out);
-    }
-    return nullptr;
-}
-
-int main(int argc, char* argv[]) {
-    if (argc != 4) {
-        std::cerr << "Использование: ./secure_copy <input> <output> <key>\n";
-        return 1;
+    } else if (mode_arg == "--mode=sequential") {
+        stats = run_sequential();
+    } else if (mode_arg == "--mode=parallel") {
+        stats = run_parallel();
     }
 
-    const char* input  = argv[1];
-    const char* output = argv[2];
-    int key = atoi(argv[3]) & 0xFF;
+    // Вывод статистики
+    std::cout << "\n=== Статистика (" << mode_arg << ") ===\n";
+    std::cout << "Общее время:        " << std::fixed << std::setprecision(3) 
+              << stats.total_time << " сек\n";
+    std::cout << "Файлов обработано:  " << stats.files_processed << " / " 
+              << files_to_copy.size() << "\n";
+    if (stats.files_processed > 0)
+        std::cout << "Среднее время/файл: " << std::fixed << std::setprecision(3) 
+                  << stats.avg_time_per_file << " сек\n";
 
-    if (access(input, R_OK) != 0) {
-        std::cerr << "Ошибка: входной файл не найден!\n";
-        return 1;
-    }
-
-    set_key(static_cast<char>(key));
-
-    FILE* fin = fopen(input, "rb");
-    FILE* fout = fopen(output, "wb");
-    if (!fin || !fout) {
-        std::cerr << "Ошибка открытия файлов!\n";
-        return 1;
-    }
-
-    SharedData sh{};
-    sh.in = fin;
-    sh.out = fout;
-    sh.buf_len = 0;
-    sh.eof = false;
-
-    pthread_mutex_init(&sh.mutex, nullptr);
-    pthread_cond_init(&sh.not_empty, nullptr);
-    pthread_cond_init(&sh.not_full, nullptr);
-
-    signal(SIGINT, sigint_handler);
-
-    pthread_t prod, cons;
-    pthread_create(&prod, nullptr, producer, &sh);
-    pthread_create(&cons, nullptr, consumer, &sh);
-
-    pthread_join(prod, nullptr);
-    pthread_join(cons, nullptr);
-
-    pthread_mutex_destroy(&sh.mutex);
-    pthread_cond_destroy(&sh.not_empty);
-    pthread_cond_destroy(&sh.not_full);
-
-    fclose(fin);
-    fclose(fout);
-
-    if (keep_running) {
-        std::cout << "Готово! Файл успешно зашифрован/скопирован.\n";
-    }
+    std::cout << "\nГотово!\n";
     return 0;
 }

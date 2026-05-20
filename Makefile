@@ -54,3 +54,7 @@ clean:
 	rm -f *.o *.so secure_copy log.txt output* *.bin
 
 .PHONY: all clean
+
+# Задание 4
+clean:
+	rm -f *.o *.so secure_copy log.txt my_output/* test_decrypted/* *.txt 2>/dev/null || true
