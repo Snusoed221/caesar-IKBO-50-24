@@ -1,0 +1,57 @@
+diff --git a/secure_copy.cpp b/secure_copy.cpp
+index abcdef1..1234567 100644
+--- a/secure_copy.cpp
++++ b/secure_copy.cpp
+@@ -1,12 +1,28 @@
+ // secure_copy.cpp
+ #include <iostream>
+ #include <cstdio>
++#include <sys/mman.h>
++#include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
+ #include <pthread.h>
+ #include <signal.h>
+ #include <unistd.h>
+ #include <sys/stat.h>
+ #include <ctime>
+ #include <vector>
+ #include <string>
+ #include <iomanip>
+ 
++// ====================== Задание 5: Защита памяти ======================
++static void segv_handler(int sig, siginfo_t* info, void* ctx) {
++    std::cerr << "\n[БЕЗОПАСНОСТЬ] Критическая ошибка: попытка записи в защищённую память (SIGSEGV)!" << std::endl;
++    std::cerr << "   Адрес нарушения: " << info->si_addr << std::endl;
++    _exit(1);
++}
++
+ extern "C" {
+-    void set_key(char key);
++    void set_key(const char* key_str);
+     void caesar(void* src, void* dst, int len);
++    void cleanup_key();
+ }
+ 
+@@ -180,7 +196,12 @@ int main(int argc, char* argv[]) {
+         return 1;
+     }
+ 
+-    set_key(atoi(argv[key_pos]) & 0xFF);
++    // === Задание 5 ===
++    struct sigaction sa = {};
++    sa.sa_sigaction = segv_handler;
++    sa.sa_flags = SA_SIGINFO;
++    sigaction(SIGSEGV, &sa, nullptr);
++
++    set_key(argv[key_pos]);
+ 
+     output_dir = argv[key_pos - 1];
+     mkdir(output_dir.c_str(), 0755);
+@@ -210,6 +231,8 @@ int main(int argc, char* argv[]) {
+         std::cout << "Среднее время/файл: " << stats.avg_time_per_file << " сек\n";
+ 
++    cleanup_key();
++
+     return 0;
+ }
