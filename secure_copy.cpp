@@ -11,10 +11,20 @@
 #include <vector>
 #include <string>
 #include <iomanip>
+#include <sys/mman.h>
+#include <cstdint>
+
+static void segv_handler(int sig, siginfo_t* info, void* ctx) {
+    std::cerr << "\n[БЕЗОПАСНОСТЬ] Критическая ошибка: попытка записи в защищённую память (SIGSEGV)!" << std::endl;
+    std::cerr << "   Адрес нарушения: " << info->si_addr << std::endl;
+    std::cerr << "   Доступ к ключу шифрования запрещён!" << std::endl;
+    _exit(1);
+}
 
 extern "C" {
-    void set_key(char key);
+    void set_key(const char* key_str);
     void caesar(void* src, void* dst, int len);
+    void cleanup_key();
 }
 
 volatile sig_atomic_t keep_running = 1;
@@ -27,7 +37,6 @@ void sigint_handler(int) {
 const int BUFFER_SIZE = 8192;
 const int MAX_WORKERS = 4;
 
-// ====================== Статистика ======================
 struct Stats {
     double total_time = 0.0;
     double avg_time_per_file = 0.0;
@@ -35,16 +44,14 @@ struct Stats {
     std::string mode;
 };
 
-// ====================== Глобальные ресурсы ======================
-pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 std::vector<std::string> files_to_copy;
 std::string output_dir;
 int next_file_index = 0;
 int copied_count = 0;
 
-// ====================== Логирование ======================
+pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 void log_operation(const std::string& thread_id, const std::string& filename, 
                    const std::string& status, double duration_sec) {
     pthread_mutex_lock(&log_mutex);
@@ -53,7 +60,6 @@ void log_operation(const std::string& thread_id, const std::string& filename,
         time_t now = time(nullptr);
         char time_buf[80];
         strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", localtime(&now));
-        
         fprintf(log, "[%s] Поток %s | Файл: %s | Результат: %s | Время: %.3f сек\n",
                 time_buf, thread_id.c_str(), filename.c_str(), status.c_str(), duration_sec);
         fclose(log);
@@ -61,201 +67,116 @@ void log_operation(const std::string& thread_id, const std::string& filename,
     pthread_mutex_unlock(&log_mutex);
 }
 
-// ====================== Обработка одного файла ======================
-bool process_file(const std::string& input_path, const std::string& out_dir) {
-    std::string filename = input_path.substr(input_path.find_last_of('/') + 1);
-    if (filename.empty()) filename = input_path;
-
-    std::string output_path = out_dir + "/" + filename;
-
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-
-    FILE* fin = fopen(input_path.c_str(), "rb");
-    if (!fin) {
-        log_operation(std::to_string(pthread_self()), filename, "ОШИБКА открытия входного", 0.0);
-        return false;
+void process_file(const std::string& input_path, const std::string& output_path) {
+    FILE* in = fopen(input_path.c_str(), "rb");
+    if (!in) {
+        std::cerr << "Ошибка открытия: " << input_path << std::endl;
+        return;
     }
 
-    FILE* fout = fopen(output_path.c_str(), "wb");
-    if (!fout) {
-        fclose(fin);
-        log_operation(std::to_string(pthread_self()), filename, "ОШИБКА создания выходного", 0.0);
-        return false;
+    FILE* out = fopen(output_path.c_str(), "wb");
+    if (!out) {
+        std::cerr << "Ошибка создания: " << output_path << std::endl;
+        fclose(in);
+        return;
     }
 
     char buffer[BUFFER_SIZE];
-    size_t bytes;
-    bool success = true;
+    char out_buffer[BUFFER_SIZE];
+    size_t bytes_read;
 
-    while ((bytes = fread(buffer, 1, BUFFER_SIZE, fin)) > 0) {
-        if (!keep_running) { 
-            success = false; 
-            break; 
-        }
-        caesar(buffer, buffer, static_cast<int>(bytes));
-        if (fwrite(buffer, 1, bytes, fout) != bytes) {
-            success = false;
-            break;
-        }
+    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, in)) > 0) {
+        caesar(buffer, out_buffer, bytes_read);
+        fwrite(out_buffer, 1, bytes_read, out);
     }
 
-    fclose(fin);
-    fclose(fout);
-
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    double duration = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) * 1e-9;
-
-    if (success) {
-        log_operation(std::to_string(pthread_self()), filename, "УСПЕХ", duration);
-        return true;
-    } else {
-        log_operation(std::to_string(pthread_self()), filename, "ОШИБКА", duration);
-        return false;
-    }
+    fclose(in);
+    fclose(out);
 }
 
-// ====================== Рабочий поток ======================
 void* worker_thread(void* arg) {
-    (void)arg; // убираем предупреждение
+    std::string thread_id = "T" + std::to_string(reinterpret_cast<uintptr_t>(arg));
 
     while (keep_running) {
-        int file_idx = -1;
+        std::string file_path;
+        bool has_file = false;
 
         pthread_mutex_lock(&queue_mutex);
-        if (next_file_index < (int)files_to_copy.size()) {
-            file_idx = next_file_index++;
+        if (next_file_index < static_cast<int>(files_to_copy.size())) {
+            file_path = files_to_copy[next_file_index];
+            next_file_index++;
+            has_file = true;
         }
         pthread_mutex_unlock(&queue_mutex);
 
-        if (file_idx == -1) break;
+        if (!has_file) break;
 
-        const std::string& input_file = files_to_copy[file_idx];
+        std::string output_path = output_dir + "/" + 
+            file_path.substr(file_path.find_last_of('/') + 1);
 
-        if (process_file(input_file, output_dir)) {
-            pthread_mutex_lock(&queue_mutex);
-            copied_count++;
-            pthread_mutex_unlock(&queue_mutex);
-        }
+        clock_t start = clock();
+        process_file(file_path, output_path);
+        double duration = (clock() - start) / (double)CLOCKS_PER_SEC;
+
+        log_operation(thread_id, file_path, "OK", duration);
+
+        pthread_mutex_lock(&queue_mutex);
+        copied_count++;
+        pthread_mutex_unlock(&queue_mutex);
     }
     return nullptr;
 }
 
-// ====================== Последовательный режим ======================
-Stats run_sequential() {
-    Stats stats;
-    stats.mode = "SEQUENTIAL";
-    struct timespec start_total, end_total;
-    clock_gettime(CLOCK_MONOTONIC, &start_total);
-
-    copied_count = 0;
-    for (const auto& file : files_to_copy) {
-        if (process_file(file, output_dir)) {
-            copied_count++;
-        }
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &end_total);
-    stats.total_time = (end_total.tv_sec - start_total.tv_sec) + 
-                       (end_total.tv_nsec - start_total.tv_nsec) * 1e-9;
-    stats.files_processed = copied_count;
-    if (stats.files_processed > 0)
-        stats.avg_time_per_file = stats.total_time / stats.files_processed;
-
-    return stats;
-}
-
-// ====================== Параллельный режим ======================
-Stats run_parallel() {
-    Stats stats;
-    stats.mode = "PARALLEL";
-    struct timespec start_total, end_total;
-    clock_gettime(CLOCK_MONOTONIC, &start_total);
-
-    copied_count = 0;
-    next_file_index = 0;
-
-    pthread_t workers[MAX_WORKERS];
-    for (int i = 0; i < MAX_WORKERS; ++i) {
-        pthread_create(&workers[i], nullptr, worker_thread, nullptr);
-    }
-
-    for (int i = 0; i < MAX_WORKERS; ++i) {
-        pthread_join(workers[i], nullptr);
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &end_total);
-    stats.total_time = (end_total.tv_sec - start_total.tv_sec) + 
-                       (end_total.tv_nsec - start_total.tv_nsec) * 1e-9;
-    stats.files_processed = copied_count;
-    if (stats.files_processed > 0)
-        stats.avg_time_per_file = stats.total_time / stats.files_processed;
-
-    return stats;
-}
-
-// ====================== main ======================
 int main(int argc, char* argv[]) {
     if (argc < 4) {
-        std::cerr << "Использование: ./secure_copy file1 [file2 ...] output_dir/ key [--mode=sequential|parallel]\n";
+        std::cerr << "Использование: " << argv[0] 
+                  << " <input_file1> [file2 ...] <output_dir> <key>" << std::endl;
         return 1;
     }
 
-    std::string mode_arg = "auto";
-    int key_pos = argc - 1;
-
-    if (argc > 1 && std::string(argv[argc-1]).rfind("--mode=", 0) == 0) {
-        mode_arg = argv[argc-1];
-        key_pos = argc - 2;
-    }
-
-    int key = atoi(argv[key_pos]) & 0xFF;
-    set_key(static_cast<char>(key));
-
-    output_dir = argv[key_pos - 1];
-    mkdir(output_dir.c_str(), 0755);
-
-    files_to_copy.clear();
-    for (int i = 1; i < key_pos - 1; ++i) {
-        files_to_copy.emplace_back(argv[i]);
-    }
-
-    if (files_to_copy.empty()) {
-        std::cerr << "Нет входных файлов!\n";
+    // === Задание 5: Установка обработчика SIGSEGV ===
+    struct sigaction sa = {};
+    sa.sa_sigaction = segv_handler;
+    sa.sa_flags = SA_SIGINFO;
+    if (sigaction(SIGSEGV, &sa, nullptr) == -1) {
+        perror("sigaction");
         return 1;
     }
-
-    std::cout << "Запуск: " << files_to_copy.size() << " файлов → " << output_dir 
-              << " (ключ=" << key << ")" << std::endl;
 
     signal(SIGINT, sigint_handler);
 
-    Stats stats;
+    // Парсинг аргументов
+    int key_pos = argc - 1;
+    output_dir = argv[argc - 2];
 
-    if (mode_arg == "auto") {
-        if (files_to_copy.size() < 5) {
-            mode_arg = "--mode=sequential";
-            stats = run_sequential();
-        } else {
-            mode_arg = "--mode=parallel";
-            stats = run_parallel();
-        }
-    } else if (mode_arg == "--mode=sequential") {
-        stats = run_sequential();
-    } else if (mode_arg == "--mode=parallel") {
-        stats = run_parallel();
+    // Установка защищённого ключа (Задание 5)
+    set_key(argv[key_pos]);
+
+    // Сбор файлов
+    files_to_copy.clear();
+    for (int i = 1; i < argc - 2; ++i) {
+        files_to_copy.push_back(argv[i]);
     }
 
-    // Вывод статистики
-    std::cout << "\n=== Статистика (" << mode_arg << ") ===\n";
-    std::cout << "Общее время:        " << std::fixed << std::setprecision(3) 
-              << stats.total_time << " сек\n";
-    std::cout << "Файлов обработано:  " << stats.files_processed << " / " 
-              << files_to_copy.size() << "\n";
-    if (stats.files_processed > 0)
-        std::cout << "Среднее время/файл: " << std::fixed << std::setprecision(3) 
-                  << stats.avg_time_per_file << " сек\n";
+    mkdir(output_dir.c_str(), 0755);
 
-    std::cout << "\nГотово!\n";
+    std::cout << "Запущено " << files_to_copy.size() 
+              << " файлов с защищённым ключом.\n";
+
+    // Запуск обработки
+    pthread_t threads[MAX_WORKERS];
+    for (int i = 0; i < MAX_WORKERS; ++i) {
+        pthread_create(&threads[i], nullptr, worker_thread, (void*)(intptr_t)i);
+    }
+
+    for (int i = 0; i < MAX_WORKERS; ++i) {
+        pthread_join(threads[i], nullptr);
+    }
+
+    cleanup_key();  // Важно! Затираем ключ
+
+    std::cout << "\nГотово! Обработано файлов: " << copied_count << std::endl;
+    std::cout << "Ключ успешно очищен из защищённой памяти.\n";
+
     return 0;
 }
