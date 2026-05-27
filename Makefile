@@ -58,3 +58,15 @@ clean:
 # Задание 4
 clean:
 	rm -f *.o *.so secure_copy log.txt my_output/* test_decrypted/* *.txt 2>/dev/null || true
+
+# Задание 5
+all: libcaesar.so secure_copy
+
+libcaesar.so: caesar.o
+	$(CXX) -shared -o $@ $^
+
+caesar.o: caesar.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+secure_copy: secure_copy.o
+	$(CXX) -o $@ $< -L. -lcaesar -Wl,-rpath=. -pthread
